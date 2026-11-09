@@ -35,6 +35,10 @@ select,input,textarea{background:var(--cartao2);border:1px solid var(--linha);bo
 .ritmo{position:absolute;top:-4px;width:2px;height:18px;background:var(--texto);opacity:.55}
 .rodape{display:flex;justify-content:space-between;gap:8px;color:var(--cinza);font-size:13px;margin-top:10px;flex-wrap:wrap}.rodape b{color:var(--texto)}
 .leg{color:var(--cinza);font-size:12px;margin:8px 0 0}
+.info{display:flex;gap:8px;flex-wrap:wrap;margin:-8px 0 18px}
+.info span{background:var(--cartao);border:1px solid var(--linha);border-radius:99px;padding:4px 12px;font-size:12px;color:var(--cinza)}
+.info b{color:var(--texto);font-weight:600}
+.info:empty{display:none}
 .pend{border:1px solid var(--alerta);margin-top:18px}.pend h2{color:var(--alerta)}
 .muted{color:var(--cinza);font-size:13px}
 .filtros{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
@@ -78,6 +82,7 @@ dialog::backdrop{background:rgba(0,0,0,.65)}
     </div>
   </div>
   <p class="sub" id="resumo"></p>
+  <div class="info" id="info"></div>
   <div id="corpo"></div>
 </main>
 
@@ -109,8 +114,17 @@ const PADRAO = {
   },
   nomes: {},     // "nome normalizado" -> categoria
   manual: {},    // id do lançamento -> categoria
-  lanc: {}       // id -> {id,data,valor,desc}
+  lanc: {},      // id -> {id,data,valor,desc}
+  envios: [],    // {quando, arquivo, de, ate, novos}
+  atualizado: null
 };
+let protegido = null;
+async function protegerDados(){
+  try{
+    if(!navigator.storage || !navigator.storage.persist) { protegido = false; return; }
+    protegido = await navigator.storage.persisted() || await navigator.storage.persist();
+  }catch(e){ protegido = false; }
+}
 
 let E = carregar();
 let filtro = "todos";
@@ -125,6 +139,7 @@ function carregar(){
   return structuredClone(PADRAO);
 }
 function salvar(){
+  E.atualizado = new Date().toISOString();
   try{ localStorage.setItem(CHAVE, JSON.stringify(E)); }
   catch(e){ aviso("Não consegui salvar neste navegador (modo anônimo?). Faça um backup em Ajustes."); }
 }
@@ -139,6 +154,9 @@ function hash(s){let h1=0xdeadbeef,h2=0x41c6ce57;for(let i=0;i<s.length;i++){con
   h1=Math.imul(h1^(h1>>>16),2246822507)^Math.imul(h2^(h2>>>13),3266489909);h2=Math.imul(h2^(h2>>>16),2246822507)^Math.imul(h1^(h1>>>13),3266489909);
   return (4294967296*(2097151&h2)+(h1>>>0)).toString(36);}
 let tAviso; function aviso(msg){const a=$("#aviso");a.textContent=msg;a.classList.add("on");clearTimeout(tAviso);tAviso=setTimeout(()=>a.classList.remove("on"),3200);}
+const fmtDia = iso => iso ? `${iso.slice(8,10)}/${iso.slice(5,7)}/${iso.slice(0,4)}` : "—";
+function fmtQuando(iso){ if(!iso) return "—"; const d = new Date(iso);
+  return d.toLocaleDateString("pt-BR") + " às " + d.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}); }
 function slug(t){return norm(t).replace(/ /g,"_")||("cat_"+Date.now());}
 
 /* ---------- leitura de extrato ---------- */
@@ -216,6 +234,12 @@ async function lerArquivo(file){
 function importarTexto(nome, texto){
   const ehOFX = /\.ofx$/i.test(nome) || /<OFX>/i.test(texto);
   const itens = ehOFX ? lerOFX(texto) : lerCSV(texto);
+  // período do extrato: linha "Período ... dd/mm/aaaa a dd/mm/aaaa" (Santander e outros) ou datas dos lançamentos
+  let de = null, ate = null;
+  const mp = texto.match(/per[ií]odo[^\n]*?(\d{2}\/\d{2}\/\d{4})\s*(?:a|at[eé]|-)\s*(\d{2}\/\d{2}\/\d{4})/i);
+  if(mp){ de = dataBR(mp[1]); ate = dataBR(mp[2]); }
+  else if(ehOFX){ const s = texto.match(/<DTSTART>(\d{8})/i), f = texto.match(/<DTEND>(\d{8})/i); if(s&&f){ de=dataBR(s[1]); ate=dataBR(f[1]); } }
+  if(!de && itens.length){ const ds = itens.map(i=>i.data).sort(); de = ds[0]; ate = ds[ds.length-1]; }
   const vistos={}; let novos=0, saidas=0;
   for(const it of itens){
     if(it.valor >= 0) continue;
@@ -225,7 +249,10 @@ function importarTexto(nome, texto){
     const id = hash(it.fitid ? "f|"+it.fitid : k+"|"+vistos[k]);
     if(!E.lanc[id]){ E.lanc[id] = {id, data:it.data, valor:Math.round(-it.valor*100)/100, desc:it.desc}; novos++; }
   }
-  return {lidos:itens.length, saidas, novos};
+  if(itens.length){
+    E.envios = (E.envios||[]).concat({quando:new Date().toISOString(), arquivo:nome, de, ate, novos}).slice(-30);
+  }
+  return {lidos:itens.length, saidas, novos, de, ate};
 }
 
 /* ---------- categorias ---------- */
@@ -288,6 +315,13 @@ function render(){
   const doMes = Object.values(E.lanc).filter(l=>l.data.startsWith(mesAtual)).map(l=>({...l, ...categoria(l)}))
                   .sort((a,b)=> b.data.localeCompare(a.data) || b.valor-a.valor);
   const total = Object.keys(E.lanc).length;
+  const ult = (E.envios||[]).slice(-1)[0];
+  const ultData = Object.values(E.lanc).map(l=>l.data).sort().pop();
+  $("#info").innerHTML = !total ? "" :
+    (ult ? `<span>Último extrato enviado: <b>${esc(fmtQuando(ult.quando))}</b></span>
+            <span>Período do extrato: <b>${fmtDia(ult.de)} a ${fmtDia(ult.ate)}</b></span>`
+         : `<span>Dados até <b>${fmtDia(ultData)}</b></span>`) +
+    `<span>Última atualização: <b>${esc(fmtQuando(E.atualizado))}</b></span>`;
   if(!total){
     $("#resumo").textContent = "";
     $("#corpo").innerHTML = `<div class="caixa vazio"><b>Comece subindo o extrato do banco</b>
@@ -371,6 +405,9 @@ function renderAjustes(){
 
     <h3>Backup e dados</h3>
     <p class="muted">Seus dados ficam só neste navegador. Para usar em outro aparelho, baixe o backup aqui e carregue lá. ${Object.keys(E.lanc).length} lançamentos guardados.</p>
+    <p class="muted">Proteção contra apagamento automático: ${protegido ? '<b style="color:var(--bom)">ativa</b> (o navegador não apaga sozinho)' : protegido===false ? '<b style="color:var(--alerta)">não concedida</b> — o navegador pode apagar se faltar espaço ou após dias sem uso (Safari). Faça backup de vez em quando.' : "verificando…"}</p>
+    ${(E.envios||[]).length ? `<label>Extratos enviados</label><div class="tab-scroll"><table><tr><th>Enviado em</th><th>Período</th><th class="vv">Novos</th></tr>
+      ${E.envios.slice().reverse().map(e=>`<tr><td>${esc(fmtQuando(e.quando))}</td><td>${fmtDia(e.de)} a ${fmtDia(e.ate)}</td><td class="vv">${e.novos}</td></tr>`).join("")}</table></div>` : ""}
     <div class="acoes"><button id="bkBaixar">Baixar backup</button><button id="bkCarregar">Carregar backup</button>
       <input type="file" id="bkArq" accept=".json" hidden>
       <button class="perigo" id="apagarMes">Apagar lançamentos do mês</button>
@@ -384,6 +421,7 @@ async function subir(files){
   let novos=0, lidos=0;
   for(const f of files){ const r = await lerArquivo(f); novos+=r.novos; lidos+=r.saidas; }
   salvar();
+  await protegerDados();
   const datas = Object.values(E.lanc).map(l=>l.data).sort();
   if(novos) mesAtual = datas[datas.length-1].slice(0,7);
   render();
@@ -445,6 +483,7 @@ $("#ajustes").addEventListener("click", e => {
 
 window.__importarTexto = (n,t)=>{ const r=importarTexto(n,t); salvar(); render(); return r; };
 render();
+protegerDados();
 </script>
 </body>
 </html>
